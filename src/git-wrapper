@@ -1,0 +1,519 @@
+#!/usr/bin/env bash
+#
+# git-wrapper
+#
+# Intercept a full git clone, allow listed organisations, repos, or patterns,
+# then run the post-clone script at the root of the new repository.
+# pull, fetch, bare clones, mirror clones, and every other command are
+# passed through.
+#
+
+# Project version. bump-my-version rewrites this assignment.
+# shellcheck disable=SC2034
+VERSION="0.0.0"
+
+# File name looked up at the root of each cloned repository.
+# Change this when those repositories use a different script name.
+POST_CLONE_SCRIPT="post-clone"
+
+# Hosts that may run post-clone. A host must match an entry here.
+# A plain name is exact. "*" matches every host. Any other entry is a Bash
+# extended regular expression used as written. Add ^ and $ in the entry when
+# it should match the whole host. Denied hosts always win.
+# Ships empty. Add the hosts you trust.
+ALLOWED_HOSTS=()
+
+# Hosts that are never allowed, even when also matched above.
+# Same matching rules as ALLOWED_HOSTS.
+DENIED_HOSTS=()
+
+# Ask before running the repository post-clone script.
+# Set to false to run without a prompt.
+CONFIRM_BEFORE_RUN="true"
+
+# Organisations. A plain name is exact. "*" matches every organisation.
+# Any other entry is a regular expression used as written.
+# A listed organisation allows every repository in it unless that
+# organisation or repository is denied.
+ALLOWED_ORGS=()
+
+# Organisations that are never allowed, even when also matched above.
+# Same matching rules as ALLOWED_ORGS. These always win.
+DENIED_ORGS=()
+
+# org/repo pairs. A plain pair is exact. "*" matches every repository.
+# Any other entry is a regular expression used as written.
+# Ships empty. Add the repositories you trust.
+ALLOWED_REPOS=()
+
+# org/repo pairs that are never allowed, including inside an allowed organisation.
+# Same matching rules as ALLOWED_REPOS. These always win.
+DENIED_REPOS=()
+
+function clone_option_takes_value()
+{
+    case "$1" in
+        -j|--jobs|--template|--reference|--reference-if-able|-o|--origin|-b|--branch|--revision|-u|--upload-pack|--depth|--shallow-since|--shallow-exclude|--separate-git-dir|--ref-format|-c|--config|--server-option|--filter|--bundle-uri)
+            return 0
+            ;;
+    esac
+    return 1
+}
+
+function derive_clone_dir()
+{
+    local repo="$1"
+    local name
+
+    while [[ "$repo" == */ ]]; do
+        repo="${repo%/}"
+    done
+
+    name="${repo##*/}"
+    if [[ "$repo" != *"://"* ]]; then
+        name="${name##*:}"
+    fi
+
+    if [[ "$name" == ".git" ]]; then
+        repo="${repo%/*}"
+        while [[ "$repo" == */ ]]; do
+            repo="${repo%/}"
+        done
+        name="${repo##*/}"
+        if [[ "$repo" != *"://"* ]]; then
+            name="${name##*:}"
+        fi
+    fi
+
+    if [[ "$name" == *.git ]]; then
+        name="${name%.git}"
+    fi
+
+    printf '%s\n' "$name"
+}
+
+function parse_clone_args()
+{
+    local -a args=("$@")
+    local arg rest ch i=0 take_next take_kind end_opts=0 next
+
+    GW_POSITIONALS=()
+    GW_REMOTE_NAME="origin"
+
+    while [[ "$i" -lt "${#args[@]}" ]]; do
+        arg="${args[$i]}"
+        if [[ "$end_opts" -eq 1 ]]; then
+            GW_POSITIONALS+=("$arg")
+            i=$((i + 1))
+            continue
+        fi
+
+        if [[ "$arg" == "--" ]]; then
+            end_opts=1
+            i=$((i + 1))
+            continue
+        fi
+
+        if [[ "$arg" == "--no-origin" ]]; then
+            GW_REMOTE_NAME=""
+            i=$((i + 1))
+            continue
+        fi
+
+        if [[ "$arg" == --origin=* ]]; then
+            GW_REMOTE_NAME="${arg#--origin=}"
+            i=$((i + 1))
+            continue
+        fi
+
+        if [[ "$arg" == "--origin" ]]; then
+            next="${args[$((i + 1))]:-}"
+            GW_REMOTE_NAME="$next"
+            i=$((i + 2))
+            continue
+        fi
+
+        if [[ "$arg" == --no-* || "$arg" == --*=* ]]; then
+            i=$((i + 1))
+            continue
+        fi
+
+        if [[ "$arg" == --* ]]; then
+            if clone_option_takes_value "$arg"; then
+                i=$((i + 2))
+            else
+                i=$((i + 1))
+            fi
+            continue
+        fi
+
+        if [[ "$arg" == -* ]]; then
+            rest="${arg:1}"
+            take_next=0
+            take_kind=""
+            while [[ -n "$rest" ]]; do
+                ch="${rest:0:1}"
+                rest="${rest:1}"
+                case "$ch" in
+                    b|c|j|o|u)
+                        if [[ -n "$rest" ]]; then
+                            if [[ "$ch" == "o" ]]; then
+                                GW_REMOTE_NAME="$rest"
+                            fi
+                            rest=""
+                        else
+                            take_next=1
+                            take_kind="$ch"
+                        fi
+                        ;;
+                esac
+            done
+            if [[ "$take_next" -eq 1 ]]; then
+                next="${args[$((i + 1))]:-}"
+                if [[ "$take_kind" == "o" ]]; then
+                    GW_REMOTE_NAME="$next"
+                fi
+                i=$((i + 2))
+            else
+                i=$((i + 1))
+            fi
+            continue
+        fi
+
+        GW_POSITIONALS+=("$arg")
+        i=$((i + 1))
+    done
+}
+
+function get_git_root()
+{
+    local dir
+
+    parse_clone_args "$@"
+
+    if [[ "${#GW_POSITIONALS[@]}" -ge 2 ]]; then
+        dir="${GW_POSITIONALS[1]}"
+    elif [[ "${#GW_POSITIONALS[@]}" -eq 1 ]]; then
+        dir="$(derive_clone_dir "${GW_POSITIONALS[0]}")"
+    else
+        return 1
+    fi
+
+    if [[ -z "$dir" || ! -d "$dir" ]]; then
+        return 1
+    fi
+
+    realpath -- "$dir"
+}
+
+function entry_matches()
+{
+    local value="$1"
+    local plain_form="$2"
+    local entry="$3"
+    local lowered
+
+    lowered="$(printf '%s\n' "$entry" | tr '[:upper:]' '[:lower:]')"
+    if [[ "$lowered" == "*" || "$lowered" == ".*" ]]; then
+        return 0
+    fi
+
+    if [[ "$lowered" == "$value" ]]; then
+        return 0
+    fi
+
+    # A plain name is exact, so github.com does not match notgithub.com.
+    # shellcheck disable=SC2076
+    if [[ "$lowered" =~ $plain_form ]]; then
+        return 1
+    fi
+
+    # Use the expression as written. Anchors are not added.
+    # shellcheck disable=SC2076
+    [[ "$value" =~ $lowered ]]
+}
+
+function list_matches()
+{
+    local value="$1"
+    local plain_form="$2"
+    shift 2
+    local element
+
+    for element in "$@"; do
+        if entry_matches "$value" "$plain_form" "$element"; then
+            return 0
+        fi
+    done
+
+    return 1
+}
+
+function parse_git_url()
+{
+    local url="$1"
+    local rest path hostport orgpath
+
+    PARSE_HOST=""
+    PARSE_ORG=""
+    PARSE_REPO=""
+
+    while [[ "$url" == */ ]]; do
+        url="${url%/}"
+    done
+
+    if [[ "$url" == file://* ]]; then
+        return 2
+    fi
+
+    if [[ "$url" == *"://"* ]]; then
+        rest="${url#*://}"
+        if [[ "$rest" == *@* ]]; then
+            rest="${rest#*@}"
+        fi
+        if [[ "$rest" == */* ]]; then
+            hostport="${rest%%/*}"
+            path="${rest#*/}"
+        else
+            hostport="$rest"
+            path=""
+        fi
+        PARSE_HOST="${hostport%%:*}"
+    elif [[ "$url" == *@*:* ]]; then
+        rest="${url#*@}"
+        PARSE_HOST="${rest%%:*}"
+        path="${rest#*:}"
+    else
+        return 2
+    fi
+
+    PARSE_HOST="$(printf '%s\n' "$PARSE_HOST" | tr '[:upper:]' '[:lower:]')"
+    if [[ -z "$PARSE_HOST" || -z "$path" || "$path" != */* ]]; then
+        return 1
+    fi
+
+    PARSE_REPO="${path##*/}"
+    orgpath="${path%/*}"
+    PARSE_ORG="${orgpath##*/}"
+    PARSE_ORG="$(printf '%s\n' "$PARSE_ORG" | tr '[:upper:]' '[:lower:]')"
+    PARSE_REPO="$(printf '%s\n' "$PARSE_REPO" | tr '[:upper:]' '[:lower:]' | sed 's/\.git$//')"
+    if [[ -z "$PARSE_ORG" || -z "$PARSE_REPO" ]]; then
+        return 1
+    fi
+    return 0
+}
+
+function host_is_allowed()
+{
+    local host="$1"
+    local plain='^[a-z0-9.-]+$'
+
+    if list_matches "$host" "$plain" "${DENIED_HOSTS[@]}"; then
+        echo "This host is denied. Skipping."
+        return 1
+    fi
+
+    if list_matches "$host" "$plain" "${ALLOWED_HOSTS[@]}"; then
+        return 0
+    fi
+
+    echo "This host is not allowed. Skipping."
+    return 1
+}
+
+function origin_is_allowed()
+{
+    local root="$1"
+    local remote_url="" kind seeking
+
+    parse_clone_args "${GW_CLONE_ARGS[@]}"
+
+    if [[ -n "$GW_REMOTE_NAME" ]]; then
+        remote_url="$(git -C "$root" config --get "remote.${GW_REMOTE_NAME}.url" 2>/dev/null || true)"
+    fi
+    if [[ -z "$remote_url" && "${#GW_POSITIONALS[@]}" -ge 1 ]]; then
+        remote_url="${GW_POSITIONALS[0]}"
+    fi
+    if [[ -z "$remote_url" ]]; then
+        echo "This clone has no remote URL to check. Skipping."
+        return 1
+    fi
+
+    parse_git_url "$remote_url"
+    kind=$?
+    if [[ "$kind" -eq 2 ]]; then
+        echo "This clone has no host to check. Skipping."
+        return 1
+    fi
+    if [[ "$kind" -ne 0 ]]; then
+        echo "Unsupported URL format. Skipping."
+        return 1
+    fi
+
+    if ! host_is_allowed "$PARSE_HOST"; then
+        return 1
+    fi
+
+    seeking="${PARSE_ORG}/${PARSE_REPO}"
+    if list_matches "$PARSE_ORG" '^[a-z0-9._-]+$' "${DENIED_ORGS[@]}"; then
+        echo "This organisation is denied. Skipping."
+        return 1
+    fi
+
+    if list_matches "$seeking" '^[a-z0-9._-]+/[a-z0-9._-]+$' "${DENIED_REPOS[@]}"; then
+        echo "This repository is denied. Skipping."
+        return 1
+    fi
+
+    if list_matches "$PARSE_ORG" '^[a-z0-9._-]+$' "${ALLOWED_ORGS[@]}" \
+        || list_matches "$seeking" '^[a-z0-9._-]+/[a-z0-9._-]+$' "${ALLOWED_REPOS[@]}"; then
+        echo "Origin allowed: ${seeking}"
+        return 0
+    fi
+
+    echo "This repository is not allowed. Skipping."
+    return 1
+}
+
+function run_repo_post_clone()
+{
+    local root="$1"
+    local script="${root}/${POST_CLONE_SCRIPT}"
+    local answer
+
+    if [[ ! -f "$script" ]]; then
+        echo "No ${POST_CLONE_SCRIPT} script at the repository root. Skipping."
+        return 0
+    fi
+
+    if [[ ! -x "$script" ]]; then
+        echo "${POST_CLONE_SCRIPT} is not executable. Mark it executable with chmod +x. Skipping."
+        return 0
+    fi
+
+    case "$CONFIRM_BEFORE_RUN" in
+        false|FALSE|no|NO|0|off|OFF)
+            ;;
+        true|TRUE|yes|YES|1|on|ON)
+            if [[ ! -t 0 ]]; then
+                echo "Confirmation is required and there is no terminal. Skipping."
+                return 0
+            fi
+            printf 'Run %s in %s? [y/N] ' "$POST_CLONE_SCRIPT" "$root"
+            read -r answer
+            case "$answer" in
+                y|Y|yes|YES) ;;
+                *)
+                    echo "Skipped ${POST_CLONE_SCRIPT}."
+                    return 0
+                    ;;
+            esac
+            ;;
+        *)
+            echo "CONFIRM_BEFORE_RUN must be true or false. Skipping."
+            return 0
+            ;;
+    esac
+
+    (
+        cd "$root" || exit 1
+        "./${POST_CLONE_SCRIPT}"
+    )
+}
+
+function prepare_invocation()
+{
+    GW_SUBCOMMAND=""
+    GW_WORKDIR="."
+    GW_CLONE_ARGS=()
+
+    local arg expect="" seen_sub=0
+    for arg in "$@"; do
+        if [[ "$seen_sub" -eq 1 ]]; then
+            GW_CLONE_ARGS+=("$arg")
+            continue
+        fi
+
+        if [[ -n "$expect" ]]; then
+            if [[ "$expect" == "workdir" ]]; then
+                if [[ "$arg" == /* ]]; then
+                    GW_WORKDIR="$arg"
+                else
+                    GW_WORKDIR="${GW_WORKDIR%/}/$arg"
+                fi
+            fi
+            expect=""
+            continue
+        fi
+
+        case "$arg" in
+            -C)
+                expect="workdir"
+                ;;
+            -c|--git-dir|--namespace|--super-prefix|--config-env|--exec-path|--work-tree)
+                expect="skip"
+                ;;
+            --git-dir=*|--namespace=*|--super-prefix=*|--config-env=*|--exec-path=*|--work-tree=*)
+                ;;
+            --)
+                ;;
+            -*)
+                ;;
+            *)
+                GW_SUBCOMMAND="$arg"
+                seen_sub=1
+                ;;
+        esac
+    done
+}
+
+function clone_is_bare()
+{
+    local arg bare=0
+    for arg in "$@"; do
+        case "$arg" in
+            --bare|--mirror)
+                bare=1
+                ;;
+            --no-bare|--no-mirror)
+                bare=0
+                ;;
+        esac
+    done
+    [[ "$bare" -eq 1 ]]
+}
+
+function main()
+{
+    local root status
+
+    prepare_invocation "$@"
+    if [[ "$GW_SUBCOMMAND" != "clone" ]]; then
+        command git "$@"
+        return $?
+    fi
+
+    command git "$@"
+    status=$?
+    if [[ "$status" -ne 0 ]]; then
+        return "$status"
+    fi
+
+    if clone_is_bare "${GW_CLONE_ARGS[@]}"; then
+        return 0
+    fi
+
+    if ! root="$(cd "$GW_WORKDIR" && get_git_root "${GW_CLONE_ARGS[@]}")"; then
+        echo "Could not find the cloned directory. Skipping."
+        return 0
+    fi
+
+    if ! origin_is_allowed "$root"; then
+        return 0
+    fi
+
+    run_repo_post_clone "$root"
+    return $?
+}
+
+main "$@"
