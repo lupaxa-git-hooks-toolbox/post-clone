@@ -10,7 +10,7 @@
 
 # Project version. bump-my-version rewrites this assignment.
 # shellcheck disable=SC2034
-VERSION="0.0.0"
+VERSION="0.1.0"
 
 # File name looked up at the root of each cloned repository.
 # Change this when those repositories use a different script name.
